@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 
-static const uint32_t tun_ip_host = 0xC0A80A01u;
+static const uint32_t tun_ip_host = 0xC0A80A01u;//192.168.10.1
 
 extern int g_tun_fd;
 
@@ -41,9 +41,9 @@ void ip_input(const uint8_t *packet, size_t len) {
     uint16_t received_check = ip_copy->check;
     ip_copy->check = 0;
     uint16_t computed = ip_checksum(hdr_copy, ihl);
-    if (computed != received_check) {
-        printf("IP: bad checksum (computed=0x%04X, received=0x%04X)\n",
-               my_ntohs(computed), my_ntohs(received_check));
+    if (computed != received_check) {// for debugging if not ip_checksum(ip,ihl) != 0       
+            printf("IP: bad checksum (computed=0x%04X, received=0x%04X)\n",
+                   my_ntohs(computed), my_ntohs(received_check));
         return;
     }
 
