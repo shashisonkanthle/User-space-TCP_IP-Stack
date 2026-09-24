@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h> 
-#include <stddef.h> // for size_t
+#include <stddef.h>
 
 struct tcp_hdr {
     uint16_t src_port;
@@ -11,10 +11,10 @@ struct tcp_hdr {
     uint32_t seq;
     uint32_t ack;
     uint8_t data_off; // 4 bits data offset in 32-bit units + 4 bits reserved
-    uint8_t flags;// 6 bits flags used for control like SYN, ACK, RST etc. + 2 bits reserved
-    uint16_t window;// size of the receive window
+    uint8_t flags;    // 6 bits flags used for control like SYN, ACK, RST etc. + 2 bits reserved
+    uint16_t window;  // size of the receive window
     uint16_t checksum;
-    uint16_t urgent;// pointer to urgent data
+    uint16_t urgent;  // pointer to urgent data
 } __attribute__((packed));
 
 #define TCP_FIN 0x01
@@ -39,9 +39,9 @@ typedef enum {
 } tcp_state_t;
 
 #define TCP_BUF_SIZE 65536
+#define TCP_MSS 1460
 
 struct tcp_pcb {
-
     struct tcp_pcb *next;
     struct tcp_pcb *prev;
 
@@ -52,42 +52,51 @@ struct tcp_pcb {
 
     tcp_state_t state;
     
-    //sending pipeline
-    uint32_t snd_una;// oldest unacknowledged sequence number
-    uint32_t snd_nxt;// next sequence number to be sent
-    uint32_t snd_max;// highest sequence number sent so far
-    uint32_t iss; // initial send sequence number
+    // sending pipeline
+    uint32_t snd_una;        // oldest unacknowledged sequence number
+    uint32_t snd_nxt;        // next sequence number to be sent
+    uint32_t snd_max;        // highest sequence number sent so far
+    uint32_t iss;            // initial send sequence number
     
-    //receiving pipeline
-    uint32_t rcv_nxt; //next seq number expected to be received
-    uint32_t rcv_wnd;// size of the receive window
-    uint32_t irs; // initial receive sequence number
+    // receiving pipeline
+    uint32_t rcv_nxt;        // next seq number expected to be received
+    uint32_t rcv_wnd;        // size of the receive window
+    uint32_t irs;            // initial receive sequence number
 
     uint8_t send_buf[TCP_BUF_SIZE];
-    uint32_t send_buf_len;// total number of bytes in the send buffer
-    uint32_t send_buf_head;// index of the first byte in the send buffer that has not been acknowledged yet
+    uint32_t send_buf_len;   // total number of bytes in the send buffer
+    uint32_t send_buf_head;  // index of first byte in send buffer not ACKed yet
 
     uint8_t recv_buf[TCP_BUF_SIZE];
-    uint32_t recv_buf_len;// total number of bytes in the receive buffer
-    uint32_t recv_buf_head; // index of the first byte in the receive buffer that has not been read yet
+    uint32_t recv_buf_len;   // total number of bytes in the receive buffer
+    uint32_t recv_buf_head;  // index of first byte in receive buffer not read yet
 
-    uint32_t rto; // retransmission timeout in milliseconds
-    uint32_t srtt; // smoothed round-trip time in milliseconds
-    uint32_t rttvar; // round-trip time variation in milliseconds
-    uint32_t retrans_count; // number of retransmissions for the current segment
+    uint32_t rto;            // retransmission timeout in milliseconds
+    uint32_t srtt;           // smoothed round-trip time in milliseconds
+    uint32_t rttvar;         // round-trip time variation in milliseconds
+    uint32_t retrans_count;  // number of retransmissions for current segment
 
-    uint32_t cwnd; // congestion window size in bytes who much data can be sent before receiving an ACK
-    uint32_t ssthresh; // slow start threshold in bytes, linear growth of the congestion window after reaching this threshold
+    uint32_t cwnd;           // congestion window size in bytes
+    uint32_t ssthresh;       // slow start threshold in bytes
 
-    bool pending_close; // flag indicating whether the connection is pending closure
+    bool pending_close;      // flag indicating whether connection is pending closure
 };
 
-static inline void tcp_input(const uint8_t *payload, size_t len,
-                             uint32_t src_ip, uint32_t dst_ip) {
-    (void)payload; // void to avoid unused parameter warning
-    (void)len;
-    (void)src_ip;
-    (void)dst_ip;
-}
+extern struct tcp_pcb *tcp_pcbs;
+
+struct tcp_pcb *tcp_new_pcb(void);
+struct tcp_pcb *tcp_find_pcb(uint32_t local_ip, uint16_t local_port,
+                             uint32_t remote_ip, uint16_t remote_port);
+void tcp_send_raw(struct tcp_pcb *pcb, uint8_t flags,
+                  const uint8_t *data, size_t data_len);
+void tcp_input(const uint8_t *payload, size_t len,
+               uint32_t src_ip, uint32_t dst_ip);
+int tcp_send(struct tcp_pcb *pcb, const void *data, size_t len);
+int tcp_recv(struct tcp_pcb *pcb, void *buf, size_t len);
+void tcp_output(struct tcp_pcb *pcb);
+void tcp_init_rto(struct tcp_pcb *pcb);
+void tcp_update_rto(struct tcp_pcb *pcb, uint32_t rtt_sample);
+void tcp_handle_ack(struct tcp_pcb *pcb, uint32_t ack);
+void tcp_handle_timeout(struct tcp_pcb *pcb);
 
 #endif
