@@ -8,9 +8,27 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <arpa/inet.h>
+/*struct ifreq {
+    char ifr_name[IFNAMSIZ]; Interface name, e.g., "eth0" or "wlan0" 
+    union {
+        struct sockaddr ifr_addr;      IP address 
+        struct sockaddr ifr_dstaddr;   Point-to-point destination address 
+        struct sockaddr ifr_broadaddr;  Broadcast address 
+        struct sockaddr ifr_netmask;   Subnet mask 
+        struct sockaddr ifr_hwaddr;     MAC / Hardware address 
+        short           ifr_flags;     Interface operational flags (e.g., IFF_UP) 
+        int             ifr_ifindex;   Interface index number 
+        int             ifr_metric;     Routing metric 
+        int             ifr_mtu;       Maximum Transmission Unit (MTU) 
+        struct ifmap    ifr_map;        Hardware parameters mapping 
+        char            ifr_slave[IFNAMSIZ];  Driver slave interface name 
+        char            ifr_newname[IFNAMSIZ]; Target name for renaming 
+        char           *ifr_data;       Driver-specific private data pointer 
+    };
+};*/
 
 int tun_create(char *dev, const char *ip, int prefix) {
-    struct ifreq ifr;
+    struct ifreq ifr;// general interface request structure used for all network device configuration
     int fd, err;
 
     fd = open("/dev/net/tun", O_RDWR);
@@ -20,13 +38,13 @@ int tun_create(char *dev, const char *ip, int prefix) {
     }
 
     memset(&ifr, 0, sizeof(ifr));
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;// IFF_TUN: TUN device, IFF_NO_PI: no packet information
 
     if (*dev) {
         strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
     }
 
-    err = ioctl(fd, TUNSETIFF, (void *)&ifr);
+    err = ioctl(fd, TUNSETIFF, (void *)&ifr);// talks to device driver via file descriptor
     if (err < 0) {
         perror("tun: ioctl TUNSETIFF failed");
         close(fd);
@@ -34,8 +52,9 @@ int tun_create(char *dev, const char *ip, int prefix) {
     }
 
     strcpy(dev, ifr.ifr_name);
-
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    /*Create a socket for configuring the TUN device because 
+    To talk to the kernel's networking subsystem, you must use a socket descriptor.*/
+    int sock = socket(AF_INET, SOCK_DGRAM, 0); 
     if (sock < 0) {
         perror("tun: socket failed");
         close(fd);
@@ -74,9 +93,9 @@ int tun_create(char *dev, const char *ip, int prefix) {
 }
 
 int tun_read(int fd, uint8_t *buf, int len) {
-    return read(fd, buf, len);
+    return read(fd, buf, len);// blocking read from the TUN device file descriptor, reading up to len bytes into buf
 }
 
 int tun_write(int fd, const uint8_t *buf, int len) {
-    return write(fd, buf, len);
+    return write(fd, buf, len);// blocking write to the TUN device file descriptor, writing len bytes from buf
 }
