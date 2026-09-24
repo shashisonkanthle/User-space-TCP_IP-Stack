@@ -8,6 +8,7 @@
 #define TCP_MSS 1460
 
 struct tcp_pcb *tcp_pcbs = NULL;
+pthread_mutex_t tcp_lock = PTHREAD_MUTEX_INITIALIZER;
 
 struct tcp_pcb *tcp_new_pcb(void) {
     struct tcp_pcb *pcb = calloc(1, sizeof(struct tcp_pcb));
@@ -19,17 +20,21 @@ struct tcp_pcb *tcp_new_pcb(void) {
     pcb->cwnd = TCP_MSS;
     pcb->ssthresh = 65535;
     pcb->rcv_wnd = 65535;
+    tcp_init_rto(pcb); // Bug 14 fix: initialize RTO on creation
     pcb->next = tcp_pcbs;
     tcp_pcbs = pcb;
     return pcb;
 }
 
+
+/* Bug 3 fix: match all per-connection states by full 4-tuple, not just ESTABLISHED */
 struct tcp_pcb *tcp_find_pcb(uint32_t local_ip, uint16_t local_port,
                              uint32_t remote_ip, uint16_t remote_port) {
     struct tcp_pcb *pcb = tcp_pcbs;
     while (pcb) {
         if (pcb->local_ip == local_ip && pcb->local_port == local_port) {
-            if (pcb->state == TCP_ESTABLISHED) {
+            if (pcb->state != TCP_CLOSED && pcb->state != TCP_LISTEN) {
+                /* Per-connection state: match full 4-tuple */
                 if (pcb->remote_ip == remote_ip && pcb->remote_port == remote_port) {
                     return pcb;
                 }
@@ -53,7 +58,7 @@ void tcp_send_raw(struct tcp_pcb *pcb, uint8_t flags,
     tcp->ack = my_htonl(pcb->rcv_nxt);
     tcp->data_off = (5 << 4);
     tcp->flags = flags;
-    tcp->window = my_htons(pcb->rcv_wnd);
+    tcp->window = my_htons((uint16_t)(pcb->rcv_wnd > 65535 ? 65535 : pcb->rcv_wnd)); // Bug 10 fix: explicit clamp
     tcp->checksum = 0;
     tcp->urgent = 0;
 
@@ -102,13 +107,18 @@ void tcp_input(const uint8_t *payload, size_t len,
 
     uint8_t hdr_len = (tcp->data_off >> 4) * 4;
 
+    pthread_mutex_lock(&tcp_lock); // Bug 6 fix: lock for thread safety
+
     struct tcp_pcb *pcb = tcp_find_pcb(dst_ip, dst_port, src_ip, src_port);
 
-    if (!pcb && (flags & TCP_SYN)) {// isolating the SYN bit for new connection requests
+    if (!pcb && (flags & TCP_SYN)) {
         pcb = tcp_find_pcb(dst_ip, dst_port, 0, 0);
         if (pcb && pcb->state == TCP_LISTEN) {
             struct tcp_pcb *new_pcb = tcp_new_pcb();
-            if (!new_pcb) return;
+            if (!new_pcb) {
+                pthread_mutex_unlock(&tcp_lock);
+                return;
+            }
 
             new_pcb->state = TCP_SYN_RECEIVED;
             new_pcb->local_ip = dst_ip;
@@ -124,18 +134,35 @@ void tcp_input(const uint8_t *payload, size_t len,
             new_pcb->snd_una = new_pcb->iss;
 
             tcp_send_raw(new_pcb, TCP_SYN | TCP_ACK, NULL, 0);
-            new_pcb->snd_nxt++;// SYN | ACK act as virtual data, so we increment snd_nxt by 1, wait for ACK from client
+            new_pcb->snd_nxt++;
             printf("TCP: SYN-ACK sent, state=SYN_RECEIVED\n");
+            pthread_mutex_unlock(&tcp_lock);
             return;
         }
     }
 
     if (!pcb) {
-        printf("TCP: no PCB for connection, sending RST\n");
+        printf("TCP: no PCB for %u->%u, dropping\n", src_port, dst_port);
+        /* Bug 13: RST not implemented yet, just drop */
+        pthread_mutex_unlock(&tcp_lock);
         return;
     }
 
     switch (pcb->state) {
+        case TCP_SYN_SENT:
+            /* Active open: expecting SYN-ACK */
+            if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
+                if (ack == pcb->iss + 1) {
+                    pcb->irs = seq;
+                    pcb->rcv_nxt = seq + 1;
+                    pcb->snd_una = ack;
+                    pcb->state = TCP_ESTABLISHED;
+                    tcp_send_raw(pcb, TCP_ACK, NULL, 0);
+                    printf("TCP: connection established (active open)!\n");
+                }
+            }
+            break;
+
         case TCP_SYN_RECEIVED:
             if (flags & TCP_ACK) {
                 if (ack == pcb->iss + 1) {
@@ -149,58 +176,102 @@ void tcp_input(const uint8_t *payload, size_t len,
         case TCP_ESTABLISHED:
             if (flags & TCP_ACK) {
                 if (ack > pcb->snd_una && ack <= pcb->snd_nxt) {
-                    uint32_t acked = ack - pcb->snd_una;
-                    pcb->snd_una = ack;
-                    if (acked > 0 && pcb->send_buf_len >= acked) {
-                        memmove(pcb->send_buf,
-                                pcb->send_buf + acked,
-                                pcb->send_buf_len - acked);
-                        pcb->send_buf_len -= acked;
-                    }
-                    printf("TCP: ACKed %u bytes, snd_una=%u\n", acked, pcb->snd_una);
+                    /* Bug 15 fix: use tcp_handle_ack for congestion control + buffer management */
+                    tcp_handle_ack(pcb, ack);
                 }
             }
 
-            size_t payload_len = len - hdr_len;
-            if (payload_len > 0) {
-                if (seq == pcb->rcv_nxt) {
-                    if (pcb->recv_buf_len + payload_len <= TCP_BUF_SIZE) {
-                        memcpy(pcb->recv_buf + pcb->recv_buf_len,
-                               payload + hdr_len, payload_len);
-                        pcb->recv_buf_len += payload_len;
-                        pcb->rcv_nxt += payload_len;
-                        tcp_send_raw(pcb, TCP_ACK, NULL, 0);
-                        printf("TCP: received %zu bytes, rcv_nxt=%u\n", payload_len, pcb->rcv_nxt);
+            {
+                size_t payload_len = len - hdr_len;
+                if (payload_len > 0) {
+                    if (seq == pcb->rcv_nxt) {
+                        if (pcb->recv_buf_len + payload_len <= TCP_BUF_SIZE) {
+                            memcpy(pcb->recv_buf + pcb->recv_buf_len,
+                                   payload + hdr_len, payload_len);
+                            pcb->recv_buf_len += payload_len;
+                            pcb->rcv_nxt += payload_len;
+                            tcp_send_raw(pcb, TCP_ACK, NULL, 0);
+                            printf("TCP: received %zu bytes, rcv_nxt=%u\n", payload_len, pcb->rcv_nxt);
+                        }
+                    } else {
+                        printf("TCP: out-of-order seq (got %u, expected %u)\n", seq, pcb->rcv_nxt);
                     }
-                } else {
-                    printf("TCP: out-of-order seq (got %u, expected %u)\n", seq, pcb->rcv_nxt);
                 }
-            }
 
-            if (flags & TCP_FIN) {
-                printf("TCP: received FIN\n");
-                pcb->rcv_nxt++;
-                tcp_send_raw(pcb, TCP_ACK, NULL, 0);
-                pcb->state = TCP_CLOSE_WAIT;
+                if (flags & TCP_FIN) {
+                    printf("TCP: received FIN\n");
+                    pcb->rcv_nxt++;
+                    tcp_send_raw(pcb, TCP_ACK, NULL, 0);
+                    pcb->state = TCP_CLOSE_WAIT;
+                }
             }
             break;
 
         case TCP_CLOSE_WAIT:
+            /* Waiting for application to call t_close */
+            break;
+
+        /* Bug 11 fix: add FIN_WAIT_1 and FIN_WAIT_2 state handling */
+        case TCP_FIN_WAIT_1:
+            if (flags & TCP_ACK) {
+                if (ack == pcb->snd_nxt) {
+                    pcb->snd_una = ack;
+                    pcb->state = TCP_FIN_WAIT_2;
+                    printf("TCP: FIN ACKed, state=FIN_WAIT_2\n");
+                }
+            }
+            if (flags & TCP_FIN) {
+                pcb->rcv_nxt++;
+                tcp_send_raw(pcb, TCP_ACK, NULL, 0);
+                if (pcb->state == TCP_FIN_WAIT_2) {
+                    pcb->state = TCP_TIME_WAIT;
+                    printf("TCP: received FIN in FIN_WAIT_2, state=TIME_WAIT\n");
+                } else {
+                    pcb->state = TCP_CLOSING;
+                    printf("TCP: simultaneous close, state=CLOSING\n");
+                }
+            }
+            break;
+
+        case TCP_FIN_WAIT_2:
+            if (flags & TCP_FIN) {
+                pcb->rcv_nxt++;
+                tcp_send_raw(pcb, TCP_ACK, NULL, 0);
+                pcb->state = TCP_TIME_WAIT;
+                printf("TCP: received FIN, state=TIME_WAIT\n");
+            }
+            break;
+
+        case TCP_CLOSING:
+            if (flags & TCP_ACK) {
+                pcb->state = TCP_TIME_WAIT;
+                printf("TCP: ACK in CLOSING, state=TIME_WAIT\n");
+            }
             break;
 
         case TCP_LAST_ACK:
             if (flags & TCP_ACK) {
-                if (ack == pcb->snd_nxt + 1) {
+                /* Bug 5 fix: snd_nxt already includes FIN byte, so expect ack == snd_nxt */
+                if (ack == pcb->snd_nxt) {
                     pcb->state = TCP_CLOSED;
                     printf("TCP: connection closed\n");
                 }
             }
             break;
 
+        case TCP_TIME_WAIT:
+            /* In a full implementation, wait 2*MSL then transition to CLOSED.
+             * For simplicity, immediately close. */
+            pcb->state = TCP_CLOSED;
+            printf("TCP: TIME_WAIT -> CLOSED\n");
+            break;
+
         default:
             printf("TCP: unhandled state %d\n", pcb->state);
             break;
     }
+
+    pthread_mutex_unlock(&tcp_lock);
 }
 
 int tcp_send(struct tcp_pcb *pcb, const void *data, size_t len) {
@@ -264,7 +335,7 @@ void tcp_init_rto(struct tcp_pcb *pcb) {
     pcb->srtt = 0;
     pcb->rttvar = 250;
     pcb->rto = 1000; // after 1 second, retransmit if no ACK received
-    pcb->retrans_count = 0; // number of retransmissions for the current segment
+    pcb->retrans_count = 0;
 }
 
 void tcp_update_rto(struct tcp_pcb *pcb, uint32_t rtt_sample) {
@@ -272,9 +343,9 @@ void tcp_update_rto(struct tcp_pcb *pcb, uint32_t rtt_sample) {
         pcb->srtt = rtt_sample;
         pcb->rttvar = rtt_sample / 2;
     } else {
-        int32_t delta = (int32_t)pcb->srtt - (int32_t)rtt_sample;// signed difference
+        int32_t delta = (int32_t)pcb->srtt - (int32_t)rtt_sample;
         if (delta < 0) delta = -delta;
-        pcb->srtt = (7 * pcb->srtt + rtt_sample) / 8;// exponential weighted moving average
+        pcb->srtt = (7 * pcb->srtt + rtt_sample) / 8;
         pcb->rttvar = (3 * pcb->rttvar + delta) / 4;
     }
     pcb->rto = pcb->srtt + 4 * pcb->rttvar;
@@ -285,10 +356,21 @@ void tcp_update_rto(struct tcp_pcb *pcb, uint32_t rtt_sample) {
 
 void tcp_handle_ack(struct tcp_pcb *pcb, uint32_t ack) {
     if (ack <= pcb->snd_una) {
-        return;// old ACK, ignore
+        return;
     }
+    uint32_t acked = ack - pcb->snd_una;
     pcb->snd_una = ack;
-    pcb->retrans_count = 0;// reset retransmission count on successful ACK
+    pcb->retrans_count = 0;
+
+    /* Shift acknowledged data out of send buffer */
+    if (acked > 0 && pcb->send_buf_len >= acked) {
+        memmove(pcb->send_buf,
+                pcb->send_buf + acked,
+                pcb->send_buf_len - acked);
+        pcb->send_buf_len -= acked;
+    }
+
+    /* Congestion control */
     if (pcb->cwnd < pcb->ssthresh) {
         pcb->cwnd += TCP_MSS;
         printf("TCP Slow Start: cwnd=%u (ssthresh=%u)\n", pcb->cwnd, pcb->ssthresh);
@@ -296,6 +378,8 @@ void tcp_handle_ack(struct tcp_pcb *pcb, uint32_t ack) {
         pcb->cwnd += (TCP_MSS * TCP_MSS) / pcb->cwnd;
         printf("TCP Congestion Avoidance: cwnd=%u\n", pcb->cwnd);
     }
+
+    printf("TCP: ACKed %u bytes, snd_una=%u\n", acked, pcb->snd_una);
 }
 
 void tcp_handle_timeout(struct tcp_pcb *pcb) {
@@ -309,8 +393,8 @@ void tcp_handle_timeout(struct tcp_pcb *pcb) {
     if (pcb->rto > 64000) {
         pcb->rto = 64000;
     }
-    uint32_t offset = 0;
-    uint32_t to_send = pcb->send_buf_len - offset;
+    /* Bug 4 fix: removed dead offset variable */
+    uint32_t to_send = pcb->send_buf_len;
     if (to_send > TCP_MSS) {
         to_send = TCP_MSS;
     }
@@ -319,5 +403,19 @@ void tcp_handle_timeout(struct tcp_pcb *pcb) {
         tcp_send_raw(pcb, TCP_ACK, pcb->send_buf, to_send);
         pcb->retrans_count++;
         printf("TCP: retransmitted %u bytes (attempt %u)\n", to_send, pcb->retrans_count);
+    }
+}
+
+/* Bug 18 fix: remove and free all CLOSED PCBs from the linked list */
+void tcp_remove_closed_pcbs(void) {
+    struct tcp_pcb **pp = &tcp_pcbs;
+    while (*pp) {
+        if ((*pp)->state == TCP_CLOSED && (*pp)->accepted) {
+            struct tcp_pcb *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+        } else {
+            pp = &(*pp)->next;
+        }
     }
 }

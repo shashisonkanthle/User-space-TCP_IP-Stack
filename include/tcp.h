@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h> 
 #include <stddef.h>
+#include <pthread.h>
 
 struct tcp_hdr {
     uint16_t src_port;
@@ -80,6 +81,7 @@ struct tcp_pcb {
     uint32_t ssthresh;       // slow start threshold in bytes
 
     bool pending_close;      // flag indicating whether connection is pending closure
+    bool accepted;           // flag indicating this PCB was already accepted by t_accept
 };
 
 extern struct tcp_pcb *tcp_pcbs;
@@ -98,5 +100,8 @@ void tcp_init_rto(struct tcp_pcb *pcb);
 void tcp_update_rto(struct tcp_pcb *pcb, uint32_t rtt_sample);
 void tcp_handle_ack(struct tcp_pcb *pcb, uint32_t ack);
 void tcp_handle_timeout(struct tcp_pcb *pcb);
+void tcp_remove_closed_pcbs(void);
+
+extern pthread_mutex_t tcp_lock;
 
 #endif
