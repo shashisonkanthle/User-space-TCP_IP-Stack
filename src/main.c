@@ -12,11 +12,12 @@
 
 int g_tun_fd;
 
-int main(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+int main() {
+    
     char tun_name[16] = "tun0";
     const char *host_tun_ip = "192.168.10.2";
+    /*This is the IP address assigned to TUN device on host OS itself
+      & this IP belongs to the Linux kernel's native network stack */
     uint8_t buf[BUF_SIZE];
     int n;
 
@@ -29,6 +30,9 @@ int main(int argc, char *argv[]) {
     printf("Host side IP on %s: %s\n", tun_name, host_tun_ip);
     printf("Stack endpoint IP: 192.168.10.1\n");
     printf("Try: ping 192.168.10.1\n");
+    /*This is the IP address assumed by your User-space C Program 
+      and exists as a concept inside user space logic
+      and not configured anywhere in the linux kernel */
 
     while (1) {
         n = tun_read(g_tun_fd, buf, BUF_SIZE);
