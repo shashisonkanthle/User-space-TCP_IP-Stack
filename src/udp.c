@@ -30,6 +30,11 @@ void udp_input(const uint8_t *payload, size_t len, uint32_t src_ip, uint32_t dst
         pseudo.udp_len = my_htons(len);
 
         uint8_t check_buf[2048];
+        /* Bug 12 fix: bounds check before checksum copy */
+        if (sizeof(pseudo) + len > sizeof(check_buf)) {
+            printf("UDP: packet too large for checksum buffer (%zu bytes)\n", len);
+            return;
+        }
         memcpy(check_buf, &pseudo, sizeof(pseudo));
         memcpy(check_buf + sizeof(pseudo), payload, len);
         uint16_t computed = ip_checksum(check_buf, sizeof(pseudo) + len);
