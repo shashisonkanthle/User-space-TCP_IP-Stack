@@ -18,9 +18,15 @@
  * t_close: close a connection (sends FIN)
  */
 
+#ifndef AF_INET
 #define AF_INET 2
+#endif
+#ifndef SOCK_STREAM
 #define SOCK_STREAM 1
+#endif
+#ifndef IPPROTO_TCP
 #define IPPROTO_TCP 6
+#endif
 
 /* sockaddr_in: IPv4 address structure */
 struct sockaddr_in {

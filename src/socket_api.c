@@ -36,15 +36,17 @@ int t_socket(int domain, int type, int protocol) {
         return -1;
     }
 
-    struct tcp_pcb *pcb = tcp_new_pcb();
-    if (!pcb) {
-        return -1;
-    }
-
+    /* Bug 9 fix: allocate socket handle FIRST, then create PCB */
     int fd = find_free_socket();
     if (fd < 0) {
         printf("t_socket: no free socket handles\n");
-        free(pcb);
+        return -1;
+    }
+
+    pthread_mutex_lock(&tcp_lock);
+    struct tcp_pcb *pcb = tcp_new_pcb();
+    pthread_mutex_unlock(&tcp_lock);
+    if (!pcb) {
         return -1;
     }
 
@@ -96,13 +98,18 @@ int t_accept(int sockfd, struct sockaddr_in *addr) {
 
     printf("t_accept: waiting for connection...\n");
     while (1) {
+        pthread_mutex_lock(&tcp_lock);
         struct tcp_pcb *pcb = tcp_pcbs;
         while (pcb) {
+            /* Bug 7 fix: skip already-accepted PCBs */
             if (pcb->state == TCP_ESTABLISHED &&
                 pcb->local_port == listen_pcb->local_port &&
-                pcb != listen_pcb) {
+                pcb != listen_pcb &&
+                !pcb->accepted) {
+                pcb->accepted = true; /* Mark as accepted */
                 int new_fd = find_free_socket();
                 if (new_fd < 0) {
+                    pthread_mutex_unlock(&tcp_lock);
                     return -1;
                 }
                 sockets[new_fd].pcb = pcb;
@@ -111,11 +118,15 @@ int t_accept(int sockfd, struct sockaddr_in *addr) {
                     addr->sin_addr = pcb->remote_ip;
                     addr->sin_port = my_htons(pcb->remote_port);
                 }
+                pthread_mutex_unlock(&tcp_lock);
                 printf("t_accept: accepted connection on socket %d\n", new_fd);
                 return new_fd;
             }
             pcb = pcb->next;
         }
+        /* Bug 18: periodically clean up closed PCBs */
+        tcp_remove_closed_pcbs();
+        pthread_mutex_unlock(&tcp_lock);
         usleep(10000); /* 10ms */
     }
 }
@@ -139,9 +150,11 @@ int t_connect(int sockfd, const struct sockaddr_in *addr) {
     pcb->snd_nxt = pcb->iss;
     pcb->snd_una = pcb->iss;
 
+    pthread_mutex_lock(&tcp_lock);
     pcb->state = TCP_SYN_SENT;
     tcp_send_raw(pcb, TCP_SYN, NULL, 0);
     pcb->snd_nxt++;
+    pthread_mutex_unlock(&tcp_lock);
     printf("t_connect: SYN sent to 0x%08X:%d\n", pcb->remote_ip, pcb->remote_port);
 
     while (pcb->state != TCP_ESTABLISHED) {
@@ -160,12 +173,15 @@ int t_send(int sockfd, const void *buf, size_t len) {
         return -1;
     }
     struct tcp_pcb *pcb = sockets[sockfd].pcb;
+    pthread_mutex_lock(&tcp_lock);
     if (pcb->state != TCP_ESTABLISHED) {
         printf("t_send: not established\n");
+        pthread_mutex_unlock(&tcp_lock);
         return -1;
     }
     int ret = tcp_send(pcb, buf, len);
     tcp_output(pcb);
+    pthread_mutex_unlock(&tcp_lock);
     return ret;
 }
 
@@ -174,14 +190,19 @@ int t_recv(int sockfd, void *buf, size_t len) {
         return -1;
     }
     struct tcp_pcb *pcb = sockets[sockfd].pcb;
-    return tcp_recv(pcb, buf, len);
+    pthread_mutex_lock(&tcp_lock);
+    int ret = tcp_recv(pcb, buf, len);
+    pthread_mutex_unlock(&tcp_lock);
+    return ret;
 }
 
+/* Bug 8 fix: don't NULL out socket entry until PCB reaches CLOSED */
 int t_close(int sockfd) {
     if (sockfd < 1 || sockfd >= MAX_SOCKETS || !sockets[sockfd].pcb) {
         return -1;
     }
     struct tcp_pcb *pcb = sockets[sockfd].pcb;
+    pthread_mutex_lock(&tcp_lock);
     switch (pcb->state) {
         case TCP_ESTABLISHED:
             tcp_send_raw(pcb, TCP_FIN | TCP_ACK, NULL, 0);
@@ -200,6 +221,8 @@ int t_close(int sockfd) {
             pcb->state = TCP_CLOSED;
             break;
     }
+    pthread_mutex_unlock(&tcp_lock);
+    /* Release socket handle — PCB remains in linked list for graceful teardown */
     sockets[sockfd].pcb = NULL;
     return 0;
 }
