@@ -25,6 +25,15 @@ static int find_free_socket(void) {
     return -1;
 }
 
+static int is_pcb_in_sockets(struct tcp_pcb *pcb) {
+    for (int i = 1; i < MAX_SOCKETS; i++) {
+        if (sockets[i].pcb == pcb) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int t_socket(int domain, int type, int protocol) {
     (void)protocol;
     if (domain != AF_INET) {
@@ -36,7 +45,6 @@ int t_socket(int domain, int type, int protocol) {
         return -1;
     }
 
-    /* Bug 9 fix: allocate socket handle FIRST, then create PCB */
     int fd = find_free_socket();
     if (fd < 0) {
         printf("t_socket: no free socket handles\n");
@@ -101,12 +109,10 @@ int t_accept(int sockfd, struct sockaddr_in *addr) {
         pthread_mutex_lock(&tcp_lock);
         struct tcp_pcb *pcb = tcp_pcbs;
         while (pcb) {
-            /* Bug 7 fix: skip already-accepted PCBs */
             if (pcb->state == TCP_ESTABLISHED &&
                 pcb->local_port == listen_pcb->local_port &&
                 pcb != listen_pcb &&
-                !pcb->accepted) {
-                pcb->accepted = true; /* Mark as accepted */
+                !is_pcb_in_sockets(pcb)) {
                 int new_fd = find_free_socket();
                 if (new_fd < 0) {
                     pthread_mutex_unlock(&tcp_lock);
@@ -124,7 +130,6 @@ int t_accept(int sockfd, struct sockaddr_in *addr) {
             }
             pcb = pcb->next;
         }
-        /* Bug 18: periodically clean up closed PCBs */
         tcp_remove_closed_pcbs();
         pthread_mutex_unlock(&tcp_lock);
         usleep(10000); /* 10ms */
@@ -190,13 +195,22 @@ int t_recv(int sockfd, void *buf, size_t len) {
         return -1;
     }
     struct tcp_pcb *pcb = sockets[sockfd].pcb;
-    pthread_mutex_lock(&tcp_lock);
-    int ret = tcp_recv(pcb, buf, len);
-    pthread_mutex_unlock(&tcp_lock);
-    return ret;
+    while (1) {
+        pthread_mutex_lock(&tcp_lock);
+        if (pcb->recv_buf_len > 0) {
+            int ret = tcp_recv(pcb, buf, len);
+            pthread_mutex_unlock(&tcp_lock);
+            return ret;
+        }
+        if (pcb->state != TCP_ESTABLISHED && pcb->state != TCP_CLOSE_WAIT) {
+            pthread_mutex_unlock(&tcp_lock);
+            return 0;
+        }
+        pthread_mutex_unlock(&tcp_lock);
+        usleep(1000); /* 1ms wait for incoming data */
+    }
 }
 
-/* Bug 8 fix: don't NULL out socket entry until PCB reaches CLOSED */
 int t_close(int sockfd) {
     if (sockfd < 1 || sockfd >= MAX_SOCKETS || !sockets[sockfd].pcb) {
         return -1;
@@ -222,7 +236,6 @@ int t_close(int sockfd) {
             break;
     }
     pthread_mutex_unlock(&tcp_lock);
-    /* Release socket handle — PCB remains in linked list for graceful teardown */
     sockets[sockfd].pcb = NULL;
     return 0;
 }

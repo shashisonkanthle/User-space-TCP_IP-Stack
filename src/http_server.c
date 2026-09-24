@@ -1,3 +1,4 @@
+#include "http_server.h"
 #include "socket_api.h"
 #include "net_utils.h"
 #include <stdio.h>
@@ -18,12 +19,14 @@ static const char *http_response =
     "\r\n"
     "Hello, World!";
 
-int http_server_run(void) {
+void *http_server_thread(void *arg) {
+    (void)arg;
+
     /* Step 1: Create a listening socket */
     int listen_fd = t_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_fd < 0) {
         fprintf(stderr, "Failed to create socket\n");
-        return 1;
+        return NULL;
     }
 
     /* Step 2: Bind to port 80 */
@@ -39,14 +42,14 @@ int http_server_run(void) {
         addr.sin_port = my_htons(8080);
         if (t_bind(listen_fd, &addr) < 0) {
             fprintf(stderr, "Failed to bind to port 8080\n");
-            return 1;
+            return NULL;
         }
     }
 
     /* Step 3: Start listening */
     if (t_listen(listen_fd, 5) < 0) {
         fprintf(stderr, "Failed to listen\n");
-        return 1;
+        return NULL;
     }
 
     printf("HTTP server listening on port %d\n", my_ntohs(addr.sin_port));
@@ -62,15 +65,9 @@ int http_server_run(void) {
         }
         printf("New connection on socket %d\n", conn_fd);
 
-        /* Step 5: Read the HTTP request */
+        /* Step 5: Read the HTTP request (blocking recv) */
         char req[1024];
-        int n = 0;
-        for (int retries = 0; retries < 100 && n <= 0; retries++) {
-            n = t_recv(conn_fd, req, sizeof(req) - 1);
-            if (n <= 0) {
-                usleep(10000); /* wait 10ms for data */
-            }
-        }
+        int n = t_recv(conn_fd, req, sizeof(req) - 1);
         if (n > 0) {
             req[n] = '\0';
             printf("Received request:\n%s\n", req);
@@ -84,5 +81,5 @@ int http_server_run(void) {
         t_close(conn_fd);
         printf("Connection closed\n\n");
     }
-    return 0;
+    return NULL;
 }
