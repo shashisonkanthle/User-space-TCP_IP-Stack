@@ -1,0 +1,16 @@
+# Build output
+*.o
+*.a
+*.so
+my_stack
+
+# Editor and IDE directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS artifacts
+.DS_Store
+Thumbs.db
